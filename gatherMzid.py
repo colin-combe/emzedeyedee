@@ -1,207 +1,142 @@
 import ftplib
-# import sys
-import json
 import logging
-# import psycopg2
 import os
-import gc
-import shutil
 import time
 
-# from MzIdParser import MzIdParser
-# from NumpyEncoder import NumpyEncoder
-# import PostgreSQL as db
-
-logging.basicConfig(
-    level=logging.ERROR,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+# count id files
+mzId_count = 0
+# logging
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s %(levelname)s %(name)s %(message)s')
 logger = logging.getLogger(__name__)
+# config
+ip = "ftp.pride.ebi.ac.uk"
+base = "pride/data/archive"
+temp_dir = os.path.expanduser('~') + "/mzid_store/"
+os.makedirs(temp_dir, exist_ok=True)
 
-class TestLoop:
 
-    def __init__(self):
-        # count parsed id files
-        self.mzId_count = 0
-        # logging
-        logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(name)s %(message)s')
-        self.logger = logging.getLogger(__name__)
-        # config
-        self.ip = "193.62.192.9"
-        self.base = "pride/data/archive"
-        # self.unimod_path = 'obo/unimod.obo'
-        self.temp_dir = os.path.expanduser('~') + "/mzid_store/"
+def all_years():
+    files = get_ftp_file_list(ip, base)
+    for f in files:
+        fetch_year(f)
 
-        # connect to DB
-        # try:
-        #     con = db.connect('')
-        # except db.DBException as e:
-        #     self.logger.error(e)
-        #     print(e)
-        #     sys.exit(1)
+def fetch_year(year):
+    print (year)
+    target_dir = base + '/' + year
+    files = get_ftp_file_list(ip, target_dir)
+    for f in files:
+        fetch_month(year + '/' + f)
 
-    def all_years(self):
-        files = self.get_ftp_file_list(self.base)
-        for f in files:
-            self.year(f)
+def fetch_month(year_month):
+    target_dir = base + '/' + year_month
+    files = get_ftp_file_list(ip, target_dir)
+    for f in files:
+        ymp = year_month + '/' + f
+        fetch_project(ymp)
 
-    def year(self, year):
-        target_dir = self.base + '/' + year
-        files = self.get_ftp_file_list(target_dir)
-        for f in files:
-            self.month(year + '/' + f)
+def fetch_project(year_month_project):
+    target_dir = base + '/' + year_month_project
+    files = get_ftp_file_list(ip, target_dir)
+    print ('>> ' + year_month_project)
+    for f in files:
+        if 'mzid' in f.lower():
+            print(f)
+            fetch_file(year_month_project, f)
+            break
 
-    def month(self, year_month):
-        target_dir = self.base + '/' + year_month
-        files = self.get_ftp_file_list(target_dir)
-        for f in files:
-            ymp = year_month + '/' + f
-            self.project(ymp)
+def fetch_file(ymp, file_name):
+    os.makedirs(temp_dir + ymp, exist_ok=True)
+    path = temp_dir + ymp + '/' + file_name
+    if os.path.exists(path):
+        print(f"Skipping {file_name} (already exists)")
+        return
 
-    def project(self, year_month_project):
-        target_dir = self.base + '/' + year_month_project
-        files = self.get_ftp_file_list(target_dir)
-        print ('>> ' + year_month_project)
-        for f in files:
-            if f.lower().endswith('mzid') or f.lower().endswith('mzid.gz'):
-                print(f)
-                self.file(year_month_project, f)
-                break
+    ftp_dir = '/' + base + '/' + ymp
+    ftp = get_ftp_login(ip)
 
-    def file(self, ymp, file_name):
-        #  make temp dir, it is entirely removed again at end of this function
-        try:
-            os.mkdir(self.temp_dir)
-        except OSError:
-            pass
-
-        path = self.temp_dir + file_name
-        target_dir = '/' + self.base + '/' + ymp
-        ftp = self.get_ftp_login()
-
-        # fetch mzId file from pride
-        try:
-            ftp.cwd(target_dir)
-            ftp.retrbinary("RETR " + file_name, open(path, 'wb').write)
-        except ftplib.error_perm as e:
-            ftp.quit()
-            error_msg = "%s: %s" % (file_name, e.args[0])
-            self.logger.error(error_msg)
-            raise e
+    # fetch mzId file from pride
+    try:
+        ftp.cwd(ftp_dir)
+        ftp.retrbinary("RETR " + file_name, open(path, 'wb').write)
+    except ftplib.error_perm as e:
         ftp.quit()
+        error_msg = "%s: %s" % (file_name, e.args[0])
+        logger.error(error_msg)
+        raise e
+    ftp.quit()
 
-        mzid_parser = MzIdParser(path, self.temp_dir, self.temp_dir, db, self.logger, 0, origin=ymp)
+def get_ftp_login(ftp_ip: str, max_retries: int = 10, base_delay: float = 1.0, max_delay: float = 300.0) -> ftplib.FTP:
+    """Log in to an FTP server with exponential backoff.
 
-        # init parser
-        try:
-            mzid_parser.initialise_mzid_reader()
-            mzid_parser.upload_info()
-            mzid_parser.check_all_spectra_data_validity()
-            peak_files = mzid_parser.get_supported_peak_list_file_names()
-        except Exception as mzId_error:
-            self.logger.exception(mzId_error)
-            error = json.dumps(mzId_error.args, cls=NumpyEncoder)
-            con = db.connect('')
-            cur = con.cursor()
-            db.write_error(mzid_parser.upload_id, type(mzId_error).__name__, error, cur, con)
-            con.close()
-            return
+    Args:
+        ftp_ip: The FTP server IP address.
+        max_retries: Maximum number of retry attempts (0 for infinite).
+        base_delay: Initial delay in seconds before first retry.
+        max_delay: Maximum delay in seconds between retries.
 
-        # fetch peak list files from pride
-        for peak_file in peak_files:
-            # don't download raw files, neater to download everything else even if not supported peak list format
-            # if not peak_file.endswith('raw'):
-            ftp = self.get_ftp_login()
-            try:
-                ftp.cwd(target_dir)
-                print('getting ' + peak_file)
-                ftp.retrbinary("RETR " + peak_file,
-                               open(self.temp_dir + peak_file, 'wb').write)
-            except ftplib.error_perm as e:
-                print('missing file: ' + peak_file + " (checking for .gz)")
-                #  check for gzipped
-                try:
-                    os.remove(self.temp_dir + peak_file)
-                    print('getting ' + peak_file + '.gz')
-                    # ftp.cwd(target_dir + '/generated/')
-                    ftp.retrbinary("RETR " + peak_file + '.gz',
-                                   open(self.temp_dir + '/' + peak_file + '.gz', 'wb').write)
-                except ftplib.error_perm as e:
-                    print('missing file: ' + peak_file + '.gz')
+    Returns:
+        An authenticated FTP connection.
 
-                    warnings = json.dumps(mzid_parser.warnings, cls=NumpyEncoder)
+    Raises:
+        ftplib.all_errors: If max_retries is exceeded.
+    """
+    attempt = 0
+    delay = base_delay
 
-                    con = db.connect('')
-                    cur = con.cursor()
-                    try:
-                        cur.execute("""
-                        UPDATE uploads SET
-                            error_type=%s,
-                            upload_error=%s,
-                            upload_warnings=%s
-                        WHERE id = %s""", ["Missing file?", peak_file, warnings, mzid_parser.upload_id])
-                        con.commit()
-                    except psycopg2.Error as e:
-                        raise db.DBException(e.message)
-                    con.close()
-                    return
-
-            ftp.close()
-
-        # actually parse
-        try:
-            mzid_parser.parse()
-        except Exception as mzid_error:
-            self.logger.exception(mzid_error)
-            error = json.dumps(mzid_error.args, cls=NumpyEncoder)
-            con = db.connect('')
-            cur = con.cursor()
-            db.write_error(mzid_parser.upload_id, type(mzid_error).__name__, error, cur, con)
-            con.close()
+    while max_retries == 0 or attempt < max_retries:
+        attempt += 1
+        logger.debug(f"FTP login attempt {attempt} to {ftp_ip}")
 
         try:
-            shutil.rmtree(self.temp_dir)
-        except OSError:
-            pass
-        self.mzId_count = self.mzId_count + 1
-        mzid_parser = None
-        gc.collect()
+            logger.debug(f"Creating FTP connection to {ftp_ip}")
+            ftp = ftplib.FTP(ftp_ip)
+            logger.debug(f"FTP connection established, attempting anonymous login")
+            ftp.login()  # Uses password: anonymous@
+            logger.debug(f"FTP login successful to {ftp_ip} on attempt {attempt}")
+            return ftp
+        except ftplib.all_errors as e:
+            logger.error(f"FTP login failed to {ftp_ip} on attempt {attempt}: {type(e).__name__}: {e}")
 
-    def get_ftp_login(ftp_ip: str) -> ftplib.FTP:
-        """Log in to an FTP server."""
-        while True:
-            time.sleep(10)  # Delay to avoid rate limiting
-            try:
-                ftp = ftplib.FTP(ftp_ip)
-                ftp.login()  # Uses password: anonymous@
-                return ftp
-            except ftplib.all_errors as e:
-                logger.error(f'FTP login failed at {time.strftime("%c")}')
+            if max_retries != 0 and attempt >= max_retries:
+                logger.error(f"Max retries ({max_retries}) exceeded for FTP login to {ftp_ip}")
+                raise
 
-    def get_ftp_file_list(ftp_ip: str, ftp_dir: str) -> list[str]:
-        """Get a list of files from an FTP directory."""
-        ftp = get_ftp_login(ftp_ip)
-        try:
-            ftp.cwd(ftp_dir)
-        except ftplib.error_perm as e:
+            # Calculate delay with exponential backoff and jitter
+            jitter = delay * 0.1 * (2 * (time.time() % 1) - 1)  # +/- 10% jitter
+            current_delay = min(delay + jitter, max_delay)
+            logger.debug(f"Waiting {current_delay:.2f}s before retry (base delay: {delay:.2f}s, max: {max_delay}s)")
+            time.sleep(current_delay)
+
+            # Exponential backoff: double the delay for next attempt
+            delay = min(delay * 2, max_delay)
+            logger.debug(f"Next retry delay set to {delay:.2f}s")
+
+    # This should be unreachable when max_retries=0, but satisfies type checker
+    raise ftplib.error_temp("FTP login failed after all retries")
+
+def get_ftp_file_list(ftp_ip: str, ftp_dir: str) -> list[str]:
+    """Get a list of files from an FTP directory."""
+    ftp = get_ftp_login(ftp_ip)
+    try:
+        ftp.cwd(ftp_dir)
+    except ftplib.error_perm as e:
+        logger.error(f"{ftp_dir}: {e}")
+        ftp.quit()
+        raise e
+    try:
+        return ftp.nlst()
+    except ftplib.error_perm as e:
+        if str(e) == "550 No files found":
+            logger.info(f"FTP: No files in {ftp_dir}")
+        else:
             logger.error(f"{ftp_dir}: {e}")
-            ftp.quit()
-            raise e
-        try:
-            return ftp.nlst()
-        except ftplib.error_perm as e:
-            if str(e) == "550 No files found":
-                logger.info(f"FTP: No files in {ftp_dir}")
-            else:
-                logger.error(f"{ftp_dir}: {e}")
-            raise e
-        finally:
-            ftp.close()
+        raise e
+    finally:
+        ftp.close()
 
 
-test_loop = TestLoop()
-# test_loop.all_years()
-
+# all_years()
+fetch_year('2025')
 # # test_loop.year('2018')
 # # test_loop.year('2017')
 # # test_loop.year('2016')
@@ -285,7 +220,7 @@ test_loop = TestLoop()
 # # prob
 # # test_loop.project("2014/04/PXD000579") # missing file name
 
-print("mzId count:" + str(test_loop.mzId_count))
+print("mzId count:" + str(mzId_count))
 
 # @staticmethod
 # def get_pride_info (pxd):
