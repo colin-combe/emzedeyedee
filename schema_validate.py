@@ -117,7 +117,7 @@ def _schema_validate_impl(xml_file: str) -> Tuple[bool, str | None, List[str]]:
 
 
 # Default timeout for schema validation (seconds)
-VALIDATION_TIMEOUT = 60
+VALIDATION_TIMEOUT = 600
 
 
 def schema_validate_with_messages(xml_file: str, timeout: int = VALIDATION_TIMEOUT) -> Tuple[bool, str | None, List[str]]:

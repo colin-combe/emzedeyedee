@@ -98,13 +98,18 @@ def validate_schemas(csv_path: str, label: str, filter_func=None):
         try:
             schema_valid, schema_version, messages = schema_validate_with_messages(file_path)
             row["schema_version"] = schema_version or ""
-            row["schema_valid"] = schema_valid
-            if schema_valid:
+            # Check if validation timed out
+            if messages and "timed out" in messages[0].lower():
+                row["schema_valid"] = "timed out"
+                row["error_message"] = messages[0]
+            elif schema_valid:
+                row["schema_valid"] = True
                 row["error_message"] = ""
-            elif messages:
-                row["error_message"] = "; ".join(messages)
+            else:
+                row["schema_valid"] = False
+                row["error_message"] = "; ".join(messages) if messages else ""
         except MemoryError as e:
-            row["schema_valid"] = False
+            row["schema_valid"] = "out of memory"
             row["error_message"] = f"Memory error: {e}"
             logger.error(f"Memory error validating {file_path}. Stopping - larger files will also fail.")
             # Write final state before stopping
@@ -115,7 +120,7 @@ def validate_schemas(csv_path: str, label: str, filter_func=None):
             return  # Stop processing
         except (EOFError, BrokenPipeError, ConnectionResetError) as e:
             # Subprocess was likely killed (OOM or other)
-            row["schema_valid"] = False
+            row["schema_valid"] = "out of memory"
             row["error_message"] = f"Subprocess killed: {e}"
             logger.error(f"Subprocess killed validating {file_path}. Stopping - larger files will also fail.")
             # Write final state before stopping
@@ -129,7 +134,7 @@ def validate_schemas(csv_path: str, label: str, filter_func=None):
             error_type = type(e).__name__.lower()
             # Detect memory-related subprocess failures
             if any(term in error_str + error_type for term in ["kill", "memory", "oom", "signal 9", "cannot allocate", "worker"]):
-                row["schema_valid"] = False
+                row["schema_valid"] = "out of memory"
                 row["error_message"] = f"Memory/process error: {e}"
                 logger.error(f"Likely memory error validating {file_path}. Stopping - larger files will also fail.")
                 # Write final state before stopping
