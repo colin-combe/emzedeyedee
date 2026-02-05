@@ -36,15 +36,30 @@ def fetch_month(year_month):
 
 def fetch_project(year_month_project):
     target_dir = base + '/' + year_month_project
-    files = get_ftp_file_list(ip, target_dir)
+    ftp = get_ftp_login(ip)
+    ftp.cwd('/' + target_dir)
     print ('>> ' + year_month_project)
-    for f in files:
-        if 'mzid' in f.lower():
-            print(f)
-            fetch_file(year_month_project, f)
-            break
 
-def fetch_file(ymp, file_name):
+    # Get detailed listing to distinguish files from directories
+    listing = []
+    ftp.retrlines('LIST', listing.append)
+    ftp.quit()
+
+    for line in listing:
+        # Parse LIST output: first char is 'd' for directory, '-' for file
+        if line.startswith('-') and 'mzid' in line.lower():
+            # Extract filename: skip first 8 fields (permissions, links, owner, group, size, month, day, year/time)
+            # Then everything after is the filename (which may contain spaces)
+            parts = line.split(None, 8)  # Split on whitespace, max 9 parts
+            if len(parts) >= 9:
+                filename = parts[8]
+                # Skip .mgf files
+                if filename.lower().endswith('.mgf'):
+                    continue
+                print(filename)
+                fetch_file(year_month_project, filename)
+
+def fetch_file(ymp, file_name, max_retries: int = 0, base_delay: float = 1.0, max_delay: float = 300.0):
     os.makedirs(temp_dir + ymp, exist_ok=True)
     path = temp_dir + ymp + '/' + file_name
     if os.path.exists(path):
@@ -52,18 +67,62 @@ def fetch_file(ymp, file_name):
         return
 
     ftp_dir = '/' + base + '/' + ymp
-    ftp = get_ftp_login(ip)
+    attempt = 0
+    delay = base_delay
 
-    # fetch mzId file from pride
-    try:
-        ftp.cwd(ftp_dir)
-        ftp.retrbinary("RETR " + file_name, open(path, 'wb').write)
-    except ftplib.error_perm as e:
-        ftp.quit()
-        error_msg = "%s: %s" % (file_name, e.args[0])
-        logger.error(error_msg)
-        raise e
-    ftp.quit()
+    while max_retries == 0 or attempt < max_retries:
+        attempt += 1
+        ftp = get_ftp_login(ip)
+
+        # fetch mzId file from pride
+        try:
+            ftp.cwd(ftp_dir)
+            with open(path, 'wb') as f:
+                ftp.retrbinary("RETR " + file_name, f.write)
+            ftp.quit()
+            return  # Success
+        except ftplib.error_perm as e:
+            # Permanent error (e.g., file not found) - don't retry
+            _cleanup_partial_file(path)
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+            error_msg = "%s: %s" % (file_name, e.args[0])
+            logger.error(error_msg)
+            raise e
+        except (ConnectionResetError, OSError, EOFError, ftplib.error_temp) as e:
+            # Transient error - clean up and retry
+            _cleanup_partial_file(path)
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+            logger.error(f"Download failed for {file_name} on attempt {attempt}: {type(e).__name__}: {e}")
+
+            if max_retries != 0 and attempt >= max_retries:
+                logger.error(f"Max retries ({max_retries}) exceeded for {file_name}")
+                raise
+
+            # Exponential backoff with jitter
+            jitter = delay * 0.1 * (2 * (time.time() % 1) - 1)
+            current_delay = min(delay + jitter, max_delay)
+            logger.info(f"Retrying {file_name} in {current_delay:.2f}s (attempt {attempt + 1})")
+            print(f"  Retrying in {current_delay:.1f}s...")
+            time.sleep(current_delay)
+            delay = min(delay * 2, max_delay)
+
+    raise ftplib.error_temp(f"Download failed for {file_name} after all retries")
+
+
+def _cleanup_partial_file(path: str):
+    """Remove a partially downloaded file if it exists."""
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+            logger.debug(f"Cleaned up partial file: {path}")
+        except OSError as e:
+            logger.warning(f"Failed to clean up partial file {path}: {e}")
 
 def get_ftp_login(ftp_ip: str, max_retries: int = 10, base_delay: float = 1.0, max_delay: float = 300.0) -> ftplib.FTP:
     """Log in to an FTP server with exponential backoff.
@@ -136,7 +195,27 @@ def get_ftp_file_list(ftp_ip: str, ftp_dir: str) -> list[str]:
 
 
 # all_years()
+# fetch_project('2012/12/PXD000039')
+
+
+#warnign 2013/10/PXD000323
+
+# fetch_month('2013/11')
+# fetch_month('2013/12')
+# fetch_year('2014')
+# fetch_year('2015')
+# fetch_year('2016')
+fetch_year('2017')
+fetch_year('2018')
+fetch_year('2019')
+fetch_year('2020')
+fetch_year('2021')
+fetch_year('2022')
+fetch_year('2023')
+fetch_year('2024')
 fetch_year('2025')
+fetch_year('2026')
+
 # # test_loop.year('2018')
 # # test_loop.year('2017')
 # # test_loop.year('2016')
