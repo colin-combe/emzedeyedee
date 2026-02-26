@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 # Config
 MZID_STORE = os.path.expanduser("~") + "/mzid_store"
 REPORT_PATH = MZID_STORE + "/report.csv"
-CROSSLINKING_PATH = MZID_STORE + "/all_crosslinking.csv"
+# CROSSLINKING_PATH = MZID_STORE + "/all_crosslinking.csv"
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -44,22 +44,21 @@ CSV_FIELDNAMES = [
 def parse_directory(dirpath: str) -> tuple[str, date | None]:
     """Parse directory path to extract project name and date.
 
-    Expected format: .../YY/MM/project_name
-    Returns: (project_name, date) or (project_name, None) if parsing fails
+    Expected format: MZID_STORE/YYYY/MM/project_name[/optional_subdirs]
+    Returns: (project_name, date) or (directory_name, None) if parsing fails
     """
-    parts = dirpath.rstrip("/").split("/")
+    rel = os.path.relpath(dirpath, MZID_STORE)
+    parts = rel.split(os.sep)
+    # parts[0]=YYYY, parts[1]=MM, parts[2]=project, parts[3+]=subdirs
     if len(parts) >= 3:
-        project = parts[-1]
         try:
-            month = int(parts[-2])
-            year = int(parts[-3])
-            # Assume 2000s for 2-digit years
-            if year < 100:
-                year += 2000
+            year = int(parts[0])
+            month = int(parts[1])
+            project = parts[2]
             return project, date(year, month, 1)
         except (ValueError, IndexError):
-            return parts[-1], None
-    return dirpath, None
+            pass
+    return parts[-1], None
 
 
 def is_archive(filename: str) -> bool:
@@ -182,6 +181,11 @@ def generate_report():
                     logger.debug(f"Skipping archive: {filename}")
                     continue
 
+                # Skip incomplete downloads
+                if filename.endswith('.partial'):
+                    logger.debug(f"Skipping partial download: {filename}")
+                    continue
+
                 # Parse directory for project and date
                 project, file_date = parse_directory(dirpath)
 
@@ -227,32 +231,32 @@ def generate_report():
     logger.info(f"Report written to {REPORT_PATH}")
 
 
-def generate_crosslinking_report():
-    """Create all_crosslinking.csv with rows where contains_MS1002511 is True."""
-    if not os.path.exists(REPORT_PATH):
-        logger.warning("Report not found, cannot generate crosslinking report")
-        return
-
-    # Delete existing crosslinking report if it exists
-    if os.path.exists(CROSSLINKING_PATH):
-        os.remove(CROSSLINKING_PATH)
-        logger.info(f"Deleted existing {CROSSLINKING_PATH}")
-
-    count = 0
-    with open(REPORT_PATH, "r", newline="") as infile, \
-         open(CROSSLINKING_PATH, "w", newline="") as outfile:
-        reader = csv.DictReader(infile)
-        writer = csv.DictWriter(outfile, fieldnames=CSV_FIELDNAMES)
-        writer.writeheader()
-
-        for row in reader:
-            if row["contains_MS1002511"] == "True":
-                writer.writerow(row)
-                count += 1
-
-    logger.info(f"Crosslinking report written to {CROSSLINKING_PATH} ({count} rows)")
+# def generate_crosslinking_report():
+#     """Create all_crosslinking.csv with rows where contains_MS1002511 is True."""
+#     if not os.path.exists(REPORT_PATH):
+#         logger.warning("Report not found, cannot generate crosslinking report")
+#         return
+#
+#     # Delete existing crosslinking report if it exists
+#     if os.path.exists(CROSSLINKING_PATH):
+#         os.remove(CROSSLINKING_PATH)
+#         logger.info(f"Deleted existing {CROSSLINKING_PATH}")
+#
+#     count = 0
+#     with open(REPORT_PATH, "r", newline="") as infile, \
+#          open(CROSSLINKING_PATH, "w", newline="") as outfile:
+#         reader = csv.DictReader(infile)
+#         writer = csv.DictWriter(outfile, fieldnames=CSV_FIELDNAMES)
+#         writer.writeheader()
+#
+#         for row in reader:
+#             if row["contains_MS1002511"] == "True":
+#                 writer.writerow(row)
+#                 count += 1
+#
+#     logger.info(f"Crosslinking report written to {CROSSLINKING_PATH} ({count} rows)")
 
 
 if __name__ == "__main__":
     generate_report()
-    generate_crosslinking_report()
+    # generate_crosslinking_report()

@@ -8,7 +8,7 @@ import zipfile
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(name)s %(message)s')
 logger = logging.getLogger(__name__)
 
-base_dir = "/home/cc/mzid_store"
+base_dir = "/home/colin/mzid_store"
 
 
 def unzip_all():

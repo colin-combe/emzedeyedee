@@ -2,6 +2,58 @@ import ftplib
 import logging
 import os
 import time
+from urllib.parse import urlparse
+import requests
+
+
+class SlowDownloadError(Exception):
+    """Raised when download speed stays below threshold for too long."""
+    pass
+
+
+class SpeedMonitor:
+    """Callback wrapper for retrbinary that aborts slow downloads.
+
+    Wraps a file write callable. Every ``check_interval`` seconds it measures
+    the average speed since the last check.  If the speed stays below
+    ``min_speed`` bytes/sec for ``slow_timeout`` seconds continuously, raises
+    ``SlowDownloadError``.
+    """
+
+    def __init__(self, write_func, *, min_speed: int = 10 * 1024,
+                 check_interval: float = 30.0, slow_timeout: float = 1200.0):
+        self._write = write_func
+        self._min_speed = min_speed
+        self._check_interval = check_interval
+        self._slow_timeout = slow_timeout
+
+        self._bytes_since_check = 0
+        self._last_check = time.monotonic()
+        self._slow_since: float | None = None  # None = not currently slow
+
+    def __call__(self, data: bytes) -> None:
+        self._write(data)
+        self._bytes_since_check += len(data)
+
+        now = time.monotonic()
+        elapsed = now - self._last_check
+        if elapsed < self._check_interval:
+            return
+
+        speed = self._bytes_since_check / elapsed
+        self._bytes_since_check = 0
+        self._last_check = now
+
+        if speed < self._min_speed:
+            if self._slow_since is None:
+                self._slow_since = now
+            elif now - self._slow_since >= self._slow_timeout:
+                raise SlowDownloadError(
+                    f"Download speed {speed:.0f} B/s below threshold "
+                    f"{self._min_speed} B/s for over {self._slow_timeout}s"
+                )
+        else:
+            self._slow_since = None
 
 # count id files
 mzId_count = 0
@@ -17,27 +69,29 @@ os.makedirs(temp_dir, exist_ok=True)
 
 def all_years():
     files = get_ftp_file_list(ip, base)
-    for f in files:
+    for f in reversed(files):
         fetch_year(f)
 
 def fetch_year(year):
     print (year)
     target_dir = base + '/' + year
     files = get_ftp_file_list(ip, target_dir)
-    for f in files:
+    for f in reversed(files):
         fetch_month(year + '/' + f)
 
 def fetch_month(year_month):
     target_dir = base + '/' + year_month
     files = get_ftp_file_list(ip, target_dir)
-    for f in files:
+    for f in reversed(files):
         ymp = year_month + '/' + f
         fetch_project(ymp)
 
 def fetch_project(year_month_project):
     target_dir = base + '/' + year_month_project
+    full_path = '/' + target_dir
+    print(f"Attempting to access FTP directory: {full_path}")
     ftp = get_ftp_login(ip)
-    ftp.cwd('/' + target_dir)
+    ftp.cwd(full_path)
     print ('>> ' + year_month_project)
 
     # Get detailed listing to distinguish files from directories
@@ -62,6 +116,7 @@ def fetch_project(year_month_project):
 def fetch_file(ymp, file_name, max_retries: int = 0, base_delay: float = 1.0, max_delay: float = 300.0):
     os.makedirs(temp_dir + ymp, exist_ok=True)
     path = temp_dir + ymp + '/' + file_name
+    partial_path = path + '.partial'
     if os.path.exists(path):
         print(f"Skipping {file_name} (already exists)")
         return
@@ -74,16 +129,43 @@ def fetch_file(ymp, file_name, max_retries: int = 0, base_delay: float = 1.0, ma
         attempt += 1
         ftp = get_ftp_login(ip)
 
-        # fetch mzId file from pride
+        # Check for existing partial download to resume
+        existing_size = 0
+        if os.path.exists(partial_path):
+            existing_size = os.path.getsize(partial_path)
+
         try:
             ftp.cwd(ftp_dir)
-            with open(path, 'wb') as f:
-                ftp.retrbinary("RETR " + file_name, f.write)
+
+            if existing_size > 0:
+                f = open(partial_path, 'ab')
+                try:
+                    ftp.retrbinary("RETR " + file_name,
+                                   SpeedMonitor(f.write),
+                                   rest=existing_size)
+                except ftplib.error_perm as e:
+                    if _is_rest_error(e):
+                        # Server rejected REST - start over
+                        logger.warning(f"REST not supported, restarting download for {file_name}")
+                        f.close()
+                        f = open(partial_path, 'wb')
+                        ftp.retrbinary("RETR " + file_name,
+                                       SpeedMonitor(f.write))
+                    else:
+                        f.close()
+                        raise
+                f.close()
+            else:
+                with open(partial_path, 'wb') as f:
+                    ftp.retrbinary("RETR " + file_name,
+                                   SpeedMonitor(f.write))
+
             ftp.quit()
+            os.rename(partial_path, path)
             return  # Success
         except ftplib.error_perm as e:
             # Permanent error (e.g., file not found) - don't retry
-            _cleanup_partial_file(path)
+            _cleanup_partial_file(partial_path)
             try:
                 ftp.quit()
             except Exception:
@@ -91,9 +173,9 @@ def fetch_file(ymp, file_name, max_retries: int = 0, base_delay: float = 1.0, ma
             error_msg = "%s: %s" % (file_name, e.args[0])
             logger.error(error_msg)
             raise e
-        except (ConnectionResetError, OSError, EOFError, ftplib.error_temp) as e:
-            # Transient error - clean up and retry
-            _cleanup_partial_file(path)
+        except (ConnectionResetError, OSError, EOFError, ftplib.error_temp,
+                SlowDownloadError) as e:
+            # Transient error - keep partial file for resume
             try:
                 ftp.quit()
             except Exception:
@@ -102,6 +184,7 @@ def fetch_file(ymp, file_name, max_retries: int = 0, base_delay: float = 1.0, ma
 
             if max_retries != 0 and attempt >= max_retries:
                 logger.error(f"Max retries ({max_retries}) exceeded for {file_name}")
+                _cleanup_partial_file(partial_path)
                 raise
 
             # Exponential backoff with jitter
@@ -112,7 +195,14 @@ def fetch_file(ymp, file_name, max_retries: int = 0, base_delay: float = 1.0, ma
             time.sleep(current_delay)
             delay = min(delay * 2, max_delay)
 
+    _cleanup_partial_file(partial_path)
     raise ftplib.error_temp(f"Download failed for {file_name} after all retries")
+
+
+def _is_rest_error(exc: ftplib.error_perm) -> bool:
+    """Check if an error_perm was caused by a rejected REST command."""
+    msg = str(exc).lower()
+    return 'rest' in msg or msg.startswith('501') or msg.startswith('502')
 
 
 def _cleanup_partial_file(path: str):
@@ -194,9 +284,214 @@ def get_ftp_file_list(ftp_ip: str, ftp_dir: str) -> list[str]:
         ftp.close()
 
 
+def pxd_accession_to_ftp_dir(px_accession: str):
+    """Get FTP location from PRIDE API and process dataset."""
+    px_url = f"https://www.ebi.ac.uk/pride/ws/archive/v3/projects/{px_accession}/files"
+    logger.info(f"GET request to PRIDE API: {px_url}")
+    print(f"Querying PRIDE API for {px_accession}")
+    pride_response = requests.get(px_url, timeout=30)
+
+    if pride_response.status_code == 200:
+        logger.info("PRIDE API returned status code 200")
+        pride_json = pride_response.json()
+
+        if pride_json:
+            for protocol in pride_json[0].get("publicFileLocations", []):
+                if protocol["name"] == "FTP Protocol":
+                    ftp_full_url = protocol["value"]
+                    # print(f"  FTP URL from API: {ftp_full_url}")
+                    parsed_url = urlparse(ftp_full_url)
+                    # print(f"  Parsed path: {parsed_url.path}")
+                    path_parts = parsed_url.path.split("/")
+                    # print(f"  Path parts: {path_parts}")
+
+                    # Find the PXD accession in the path and extract YEAR/MONTH/PXD
+                    try:
+                        pxd_index = path_parts.index(px_accession)
+                        # Get year (2 positions before PXD) and month (1 position before PXD)
+                        if pxd_index >= 2:
+                            year = path_parts[pxd_index - 2]
+                            month = path_parts[pxd_index - 1]
+                            constructed_path = f"{year}/{month}/{px_accession}"
+                            # print(f"  Constructed path: {constructed_path}")
+                            return constructed_path
+                        else:
+                            raise ValueError(f"Not enough path components before PXD at index {pxd_index}")
+                    except ValueError as e:
+                        raise ValueError(f"Could not find {px_accession} in FTP path: {parsed_url.path}") from e
+
+        raise ValueError(
+            f"No FTP location found in PRIDE API response for {px_accession}"
+        )
+    else:
+        raise ValueError(
+            f"PRIDE API returned status code {pride_response.status_code}"
+        )
+
 # all_years()
 # fetch_project('2012/12/PXD000039')
 
+def project(projAcc):
+    fetch_project(pxd_accession_to_ftp_dir(projAcc))
+
+
+# project('PXD042282')
+# project('PXD043595')
+# project('PXD051742')
+# project('PXD061667')
+# project('PXD063329')
+# project('PXD064792')
+# project('PXD065365')
+# project('PXD065516')
+# project('PXD065858')
+# project('PXD065859')
+# project('PXD065869')
+# project('PXD065870')
+# project('PXD065871')
+# project('PXD065912')
+# project('PXD065946')
+# project('PXD065949')
+# project('PXD065956')
+# project('PXD065958')
+# project('PXD065961')
+# project('PXD001677')
+# project('PXD003718')
+project('PXD004154')
+project('PXD004583')
+project('PXD004722')
+project('PXD006079')
+project('PXD006574')
+project('PXD006928')
+project('PXD006938')
+project('PXD007716')
+project('PXD007836')
+project('PXD009079')
+project('PXD009128')
+project('PXD009641')
+project('PXD012225')
+project('PXD012466')
+project('PXD013890')
+project('PXD013896')
+project('PXD013897')
+project('PXD013899')
+project('PXD014142')
+project('PXD014821')
+project('PXD016224')
+project('PXD016256')
+project('PXD016442')
+project('PXD016446')
+project('PXD016448')
+project('PXD016487')
+project('PXD017290')
+project('PXD017792')
+project('PXD017873')
+project('PXD018291')
+project('PXD018600')
+project('PXD018687')
+project('PXD018701')
+project('PXD019017')
+project('PXD019713')
+project('PXD019771')
+project('PXD019868')
+project('PXD019944')
+project('PXD020418')
+project('PXD020666')
+project('PXD020958')
+project('PXD022163')
+project('PXD023525')
+project('PXD024065')
+project('PXD024253')
+project('PXD024373')
+project('PXD025066')
+project('PXD025728')
+project('PXD026101')
+project('PXD026674')
+project('PXD026829')
+project('PXD027149')
+project('PXD028685')
+project('PXD028919')
+project('PXD031159')
+project('PXD031385')
+project('PXD033004')
+project('PXD033055')
+project('PXD033175')
+project('PXD033615')
+project('PXD034393')
+project('PXD035655')
+project('PXD038128')
+project('PXD040267')
+project('PXD041334')
+project('PXD041955')
+project('PXD042549')
+project('PXD044574')
+project('PXD046392')
+project('PXD046634')
+project('PXD046895')
+project('PXD047767')
+project('PXD051423')
+project('PXD051588')
+project('PXD051661')
+project('PXD051886')
+project('PXD052584')
+project('PXD053253')
+project('PXD053415')
+project('PXD053636')
+project('PXD055077')
+project('PXD055147')
+project('PXD055405')
+project('PXD055411')
+project('PXD055603')
+project('PXD056510')
+project('PXD059974')
+project('PXD060469')
+project('PXD062002')
+project('PXD065573')
+project('PXD068080')
+project('PXD004473')
+project('PXD005786')
+project('PXD008680')
+project('PXD012759')
+project('PXD014359')
+project('PXD014520')
+project('PXD014523')
+project('PXD015037')
+project('PXD018935')
+project('PXD026603')
+project('PXD027655')
+project('PXD028039')
+project('PXD029252')
+project('PXD055169')
+project('PXD059096')
+project('PXD065782')
+project('PXD019437')
+project('PXD022936')
+project('PXD031632')
+project('PXD050457')
+project('PXD039609')
+project('PXD031755')
+project('PXD024148')
+project('PXD023533')
+project('PXD038060')
+project('PXD042173')
+project('PXD036833')
+project('PXD053341')
+project('PXD059766')
+project('PXD054720')
+project('PXD020407')
+project('PXD056910')
+project('PXD021417')
+project('PXD049195')
+project('PXD063839')
+project('PXD033366')
+project('PXD035522')
+project('PXD019120')
+project('PXD035519')
+project('PXD035362')
+project('PXD022360')
+project('PXD035508')
+project('PXD062462')
+project('PXD066083')
+project('PXD066251')
 
 #warnign 2013/10/PXD000323
 
@@ -205,16 +500,16 @@ def get_ftp_file_list(ftp_ip: str, ftp_dir: str) -> list[str]:
 # fetch_year('2014')
 # fetch_year('2015')
 # fetch_year('2016')
-fetch_year('2017')
-fetch_year('2018')
-fetch_year('2019')
-fetch_year('2020')
-fetch_year('2021')
-fetch_year('2022')
-fetch_year('2023')
-fetch_year('2024')
-fetch_year('2025')
-fetch_year('2026')
+# fetch_year('2017')
+# fetch_year('2018')
+# fetch_year('2019')
+# fetch_year('2020')
+# fetch_year('2021')
+# fetch_year('2022')
+# fetch_year('2023')
+# fetch_year('2024')
+# fetch_year('2025')
+# fetch_year('2026')
 
 # # test_loop.year('2018')
 # # test_loop.year('2017')
